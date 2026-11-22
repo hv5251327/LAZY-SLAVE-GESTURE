@@ -1,5 +1,5 @@
 """
-HandGestureController v8.0 - everything, one hand only
+HandGestureController v8.1 - bug fixes: double click + REST state
 ======================================================
 Run:      python hand_cursor_controller.py
 Selftest: python hand_cursor_controller.py --selftest    (no camera / mouse / mediapipe)
@@ -71,12 +71,29 @@ v7.3  (1) Cursor smoothing is now frame-rate independent: both the smoothing
  B10 Time kept accumulating while the process was suspended (laptop sleep):
      a jump guard now resets all timers instead of firing a burst.
 
+ v8.1  Bug fixes (reported by user):
+       F1  REST triggered too aggressively: REST_TIMEOUT raised 0.80→1.50s;
+           any visible hand now counts as "engaged" (not just index/fist/palm),
+           so a neutral or transitioning hand no longer starts the REST timer.
+       F2  WAKE_STABLE_FRAMES reduced 2→1: a single index-up frame wakes the
+           controller; previously one dropped MediaPipe frame reset the counter.
+       F3  WAKE_LOCKOUT reduced 0.35→0.20s so the first real click after waking
+           is not silently swallowed.
+       F4  Double click broken when right-click (SPECIAL) followed a pending
+           first pinch: entering SPECIAL now clears pending+deadline immediately
+           so a right-click can never accidentally resolve as a double-click.
+       F5  Double click broken when a fist or scroll-lockout interval separated
+           the two pinches: masked=True now also clears pending+deadline so a
+           ghost double-click window cannot survive across a fist or scroll phase.
+       F6  PINCH_REOPEN_DELTA reduced 0.05→0.03: the finger-gap needed to signal
+           "open" between two quick pinches was too large; users sometimes did not
+           open wide enough to trigger deadline-arming, making double click fail.
+
  v7.2  Horizontal palm swipe no longer changes track. It now seeks inside the
        video: swipe LEFT = forward, swipe RIGHT = backward (arrow keys).
        Set PALM_HORIZONTAL_MODE = "track" to get next/prev back, or
        PALM_HORIZONTAL_INVERT = True if the directions feel swapped.
 """
-
 import json
 import math
 import os
@@ -129,7 +146,7 @@ SENSITIVITY_STEP = 0.1
 # --- Pinch / click
 PINCH_THRESHOLD = 0.34
 PINCH_THRESHOLD_POINTING = 0.26
-PINCH_REOPEN_DELTA = 0.05
+PINCH_REOPEN_DELTA = 0.03      # FIX: was 0.05; smaller gap needed for quick double-click reopen
 PINCH_REOPEN_FRAMES = 2
 PINCH_FREEZE_MARGIN = 0.06     # freeze only within this band above the press threshold
 PINCH_STALE_TIMEOUT = 1.20     # a press with no release this long is discarded
@@ -184,9 +201,9 @@ SCROLL_STOP_GRACE = 0.15
 SCROLL_CLICK_LOCKOUT = 0.20
 
 # --- Rest / engage
-REST_TIMEOUT = 0.80
-WAKE_STABLE_FRAMES = 2
-WAKE_LOCKOUT = 0.35
+REST_TIMEOUT = 1.50            # FIX: was 0.80; 1.5s before REST (much less aggressive)
+WAKE_STABLE_FRAMES = 1         # FIX: was 2; 1 frame is enough to wake (avoids drop-frame resets)
+WAKE_LOCKOUT = 0.20            # FIX: was 0.35; shorter lockout so first click after wake works
 REACQUIRE_HOLD = 0.15
 
 # --- Palm swipe / volume
@@ -518,6 +535,10 @@ class ClickEngine:
             if self.state != "SPECIAL" and right_ratio < RIGHT_CLICK_RATIO:
                 self.state = "SPECIAL"
                 self.hold_timer = None
+                # FIX: clear any pending double-click window so right-click can't
+                # spuriously resolve into a double-click later
+                self.pending = False
+                self.deadline = None
                 if now - self.last_right_time >= RIGHT_CLICK_COOLDOWN:
                     self.last_right_time = now
                     self.n_right += 1
@@ -543,6 +564,10 @@ class ClickEngine:
 
         if masked:
             self.reset_contact()
+            # FIX: also clear any double-click window so a masked interval
+            # (fist, scroll lockout) cannot bridge two separate clicks into a double
+            self.pending = False
+            self.deadline = None
             return None
 
         pressed = False
@@ -918,7 +943,11 @@ class HandController:
             return
 
         index_up = is_index_extended(lm)
-        engaged = index_up or is_fist_like(lm) or is_open_palm(lm)
+        # FIX: ANY visible hand keeps the engaged timer alive, not just specific poses.
+        # Previously only index/fist/palm counted; a neutral or transitioning hand
+        # (semi-curled fingers) was not "engaged", causing REST after 0.8s even while
+        # the user was clearly using their hand.
+        engaged = True  # hand is in frame -> always engaged
 
         if not self.resting:
             if engaged:
@@ -1819,7 +1848,7 @@ def run():
     SCREEN_W, SCREEN_H = pag.size()
 
     print("=" * 60)
-    print(" HandGestureController v8.0 - Full Gesture Control")
+    print(" HandGestureController v8.1 - Full Gesture Control")
     print(f" Screen {SCREEN_W}x{SCREEN_H}   camera {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
     print(" [ ] box   - = sens   , . pinch   9 0 scroll   m preset   s sleep   q quit")
     print(" c calibrate   d dots   k/l save/load cfg   r reset   i startup   j shortcut")
@@ -1842,7 +1871,7 @@ def run():
 
     controller = HandController(hands, pag=pag)
     load_config(controller)
-    win = "HandGestureController v8.0"
+    win = "HandGestureController v8.1"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, CAMERA_WIDTH, CAMERA_HEIGHT)
 
@@ -2288,26 +2317,27 @@ def selftest():
     ctl.process(make_hand(index_up=False, fist=True, fist_y=0.55), 0.0)
     check("stays resting with fist", ctl.resting)
     ctl.process(make_hand(index_up=True), 0.05)
-    ctl.process(make_hand(index_up=True), 0.10)
+    # FIX: WAKE_STABLE_FRAMES=1 now, so just one index-up frame wakes it
     check("index wakes it", not ctl.resting)
 
+    # FIX: REST_TIMEOUT=1.5s; use enough frames to exceed it
+    # Also: ANY visible hand keeps last_engaged alive (F1), so the "idle hand"
+    # test must use lm=None (no hand) to actually let the timer tick.
     ctl = HandController(pag=None)
     ctl.resting = False
     ctl.last_engaged = 0.0
-    def rest_hand():
-        hh = make_hand(index_up=False, palm=True)
-        hh[8] = _P(0.47, 0.74)
-        return hh
-    for i in range(40):
-        ctl.process(rest_hand(), i * 0.033)
-    check("idle hand -> rest", ctl.resting)
-
-    ctl = HandController(pag=None)
-    ctl.resting = False
-    ctl.last_engaged = 0.0
-    for i in range(40):
+    n_frames = int(REST_TIMEOUT / 0.033) + 10   # just over REST_TIMEOUT
+    for i in range(n_frames):
         ctl.process(None, i * 0.033)
     check("hand lost -> rest", ctl.resting)
+
+    # Engaged hand (visible) should NOT go to rest even after a long time
+    ctl = HandController(pag=None)
+    ctl.resting = False
+    ctl.last_engaged = 0.0
+    for i in range(n_frames):
+        ctl.process(make_hand(index_up=True, pinch=0.7), i * 0.033)
+    check("visible hand stays awake", not ctl.resting)
 
     print("\n=== B10: clock jump does not fire a burst ===")
     ctl = HandController(pag=None)
